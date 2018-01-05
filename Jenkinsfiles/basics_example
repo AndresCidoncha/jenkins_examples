@@ -1,0 +1,168 @@
+/* IMPORT SHARED LIBRARY - Using shared-libraries plugin */
+@Library('shared-libraries') _
+
+// EVERYTHING YOU DEFINE AFTER THE pipeline BLOCK IS EVALUATED AS GROOVY CODE
+def tags = ['component_latest', "component_${BUILD_NUMBER}"]
+
+pipeline {
+
+    agent any
+    
+    // IF YOU NEED AN SPECIFIC AGENT YOU CAN USE
+    // agent {
+    //     label 'testing'
+    // }
+    // FOR A DOCKER AGENT YOU CAN USE:
+    // - WITH BASE IMAGE:
+    // agent {
+    //    docker {
+    //        image 'maven:3-alpine'
+    //        label 'my-defined-label'
+    //        args  '-v /tmp:/tmp'
+    //    }
+    // }
+    // - WITH DOCKERFILE:
+    // agent {
+    //    dockerfile {
+    //        dir '/var/lib/jenkins/dockerfiles/testing'
+    //        filename 'myDockerfile'
+    //        label 'my-defined-label'
+    //        additionalBuildArgs  '--build-arg version=1.0.2'
+    //        args '--privileged' // ARGS IN LAUNCH TIME
+    //    }
+    // }
+
+    triggers {
+        cron('H 3 * * 1-5') // BY CRON
+        upstream(upstreamProjects: 'myProject', threshold: hudson.model.Result.SUCCESS) // BY UPSTREAM DEPENDENCY
+        gitlab( // TRIGGER TO LAUNCH JOB IN GITLAB PUSH
+            triggerOnPush: true,
+            triggerOnMergeRequest: true,
+            triggerOnNoteRequest: true,
+            triggerOpenMergeRequestOnPush: "never",
+            noteRegex: "/rebuild", // COMMENT /rebuild IN A MR TO LAUNCH THE JOB
+            skipWorkInProgressMergeRequest: true, // WIP MR WILL NOT LAUNCH THE JOB
+            ciSkip: true, // IF MR OR COMMIT HAVE [ci-skip] JOB IS NOT LAUNCHED
+            setBuildDescription: true,
+            addNoteOnMergeRequest: false,
+            addCiMessage: false,
+            addVoteOnMergeRequest: false,
+            acceptMergeRequestOnSuccess: false,
+            branchFilterType: "NameBasedFilter",
+            includeBranchesSpec: "master, develop", // FILTER FOR PUSH OR MERGE REQUESTS TO master OR develop BRANCH 
+            excludeBranchesSpec: "",
+            secretToken: null
+        )
+    }
+
+    options {
+        ansiColor('xterm')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        disableConcurrentBuilds()
+        gitlabCommitStatus() // ASSIGN LIKE CI RESULT IN GITLAB THE CURRENT JOB RESULT
+        gitLabConnection('GITLAB')
+        skipDefaultCheckout() // AVOID TO DOWNLOAD THE REPO IF YOU DONT CALL THE GIT OR SCM STEPS
+        timeout(time: 2, unit: 'HOURS')
+        timestamps()
+    }
+
+    environment {
+        // HERE YOU CAN ADD ENVIRONMENTS VARIABLES
+        // SRC_DIR = "${GOPATH}/src/${JOB_BASE_NAME}"
+        SRC_URL = "https://gitlab.test.com/andrescidoncha/test"
+    }
+
+    stages {
+        stage('Download repo') {
+            steps {
+                git credentialsId: 'GitLabCredentials', url: "${SRC_URL}"
+                // OR CHECKOUT A SPECIFIC BRANCH
+                git branch: 'develop', credentialsId: 'GitLabCredentials', url: "${SRC_URL}"
+            }
+        }
+        stage('Tests') { // RUN TESTS IN PARALLEL
+            failFast true
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        sh './tests.sh --unit'
+                        junit '**/*unit*.xml'
+                    }
+                }
+                stage('Functional Tests') {
+                    steps {
+                        sh './tests.sh --functional'
+                        junit '**/*functional*.xml'
+                    }
+                }
+            }
+        }
+        stage ('Git tag') { // ADD A TAG IN GITLAB REPO FOR VERSIONING CODE
+            agent { label 'master' } // YOU CAN RUN A STAGE IN A SPECIFIC AGENT
+            when {
+                environment name: 'JENKINS_ENVIRONMENT', value: 'PRO' // FILTER BY ENV VARIABLE VALUE
+                expression { (env.gitlabMergeRequestId == null) } // FILTER USING A EXPRESSION
+                expression { currentBuild.resultIsBetterOrEqualTo('SUCCESS') } // RUN IF PREVIOUS STAGES ARE SUCCESSFULL
+            }
+            steps {
+                script {
+                    tags.each {
+                        sh "git tag -f -a ${it} -m \"${JOB_BASE_NAME} build number ${BUILD_NUMBER} passed automated acceptance testing.\""
+                    }
+                    sh 'git push -f --tags'
+                }
+            }
+        }
+        stage('Deploy to Dev') {
+            when {
+                environment name: 'JENKINS_ENVIRONMENT', value: 'PRO'
+                expression { (env.gitlabMergeRequestId == null) }
+                expression { currentBuild.resultIsBetterOrEqualTo('SUCCESS') }
+            }
+            steps {
+                script {
+                    docker.withRegistry("${NEXUS_DEV_URL}", 'NEXUS_DEV_CREDENTIALS') { // DOCKER PLUGIN
+                        withCredentials([usernamePassword(credentialsId: 'NEXUS_DEV_CREDENTIALS', passwordVariable: 'nexusPass', usernameVariable: 'nexusUser')]) {
+                            artifact = docker.build("${NEXUS_DEV}/${JOB_BASE_NAME}:${BUILD_NUMBER}", "--build-arg nexus_user=${nexusUser} --build-arg nexus_password=${nexusPass} .")
+                            tags.each {
+                                artifact.tag("${it}")
+                                artifact.push("${it}")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        abort {
+            echo "ABORTED BUILD!"
+        }
+        success {
+            script{
+                if (env.gitlabMergeRequestId){ // IN A MERGE REQUEST JENKINS WILL COMMENT THE BUILD RESULT
+                    addGitLabMRComment comment: ":white_check_mark: Build [${BUILD_NUMBER}](${BUILD_URL}) passed"
+                }
+            }
+        }
+        unstable {
+            script{
+                if (env.gitlabMergeRequestId){
+                    addGitLabMRComment comment: ":warning: Build [${BUILD_NUMBER}](${BUILD_URL}) failed tests"
+                }
+            }
+        }
+        failure {
+            script {
+                if (env.gitlabMergeRequestId){
+                    addGitLabMRComment comment: ":x: Build [${BUILD_NUMBER}](${BUILD_URL}console) failed"
+                }
+            }
+        }
+        cleanup {
+            // THIS ACTIONS WILL BE AFTER ALL THE OTHER POSTSTEPS
+            cleanWs() // Clean all files in workspace
+        }
+    }
+}

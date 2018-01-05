@@ -1,0 +1,100 @@
+@Library('shared-libraries') _
+
+def message = ""
+
+pipeline {
+    agent any
+
+    triggers {
+        gitlab (triggerOnPush: true,
+                triggerOnMergeRequest: true,
+                triggerOnNoteRequest: true,
+                triggerOpenMergeRequestOnPush: "never",
+                noteRegex: "/rebuild",
+                skipWorkInProgressMergeRequest: true,
+                ciSkip: true,
+                setBuildDescription: true,
+                addNoteOnMergeRequest: false,
+                addCiMessage: false,
+                addVoteOnMergeRequest: false,
+                acceptMergeRequestOnSuccess: false,
+                branchFilterType: "All",
+                includeBranchesSpec: null,
+                excludeBranchesSpec: null,
+                secretToken: null)
+    }
+
+    options {
+        ansiColor('xterm')
+        buildDiscarder(logRotator(numToKeepStr: '100'))
+        disableConcurrentBuilds()
+        gitlabCommitStatus()
+        gitLabConnection('GITLAB')
+        skipDefaultCheckout()
+        timeout(time: 2, unit: 'HOURS')
+        timestamps()
+    }
+
+    environment {
+        GROUP_NAME = getGroupName()
+    }
+
+    stages {
+
+        stage('Download repo') {
+            steps {
+                script {
+                    if (env.gitlabMergeRequestId){
+                        gitMerge()
+                    } else {
+                        git branch: "${env.gitlabSourceBranch}", credentialsId: "${SRC_CREDENTIALS}", url: "${SRC_URL}"
+                    }
+                }
+            }
+        }
+
+        stage('Check changes and notify') {
+            steps {
+                script {
+                    def changes = sh (returnStdout: true, script: "git diff --name-status origin/${env.gitlabTargetBranch} | grep \"^[^D].*/\" | cut -f2").split()
+                    changes.each {
+                        if (validateDeclarativePipeline(it)){
+                            message += ":heavy_check_mark: "
+                        } else {
+                            echo "ERROR ON ${it}"
+                            message += ":x: "
+                            currentBuild.result = 'FAILED'
+                        }
+                        message += "Changes in ${it} file\n"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                if (env.gitlabMergeRequestId) {
+                    if (env.gitlabSourceBranch == 'develop') {
+                        acceptGitLabMR mergeCommitMessage: ":heavy_check_mark: ${env.gitlabSourceBranch} branch validated and merged"
+                    } else {
+                        addGitLabMRComment comment: "${message}"
+                    }
+                }
+            }
+        }
+
+        failure {
+            script {
+                if (env.gitlabMergeRequestId) {
+                    addGitLabMRComment comment: "${message}"
+                }
+            }
+        }
+
+        cleanup {
+            cleanWs()
+        }
+    }
+}

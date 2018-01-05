@@ -1,0 +1,107 @@
+@Library("shared-libraries") _
+
+def getChoicesFromFile(file) {
+    data = readJSON file: file
+    choices = []
+    data.choices.each {
+        choices += it
+    }
+    return choices
+}
+
+pipeline {
+    agent any
+
+    trigger {
+        parameterizedCron('''5 * * * * % string_param=TEST;choice=option1''')
+    }
+
+    parameters {
+        string(defaultValue: "", description: "String parameter", name: 'string_param')
+        booleanParam(defaultValue: false, description: 'Boolean parameter', name: 'boolean_param')
+        // DEFAULT VALUE IN A CHOICE PARAMETER IS THE FIRST ELEMENT IN THE LIST
+        choice(name: 'choice', description: 'Type of nodes used as a clients', choices: getChoicesFromFile('choices.json'))
+    }
+
+    options {
+        ansiColor('xterm')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        disableConcurrentBuilds()
+        skipDefaultCheckout()
+        timeout(time: 2, unit: 'HOURS')
+        timestamps()
+    }
+
+    environment {
+        GROUP_NAME = getGroupName()
+        // TOOLS DEFINED IN GLOBAL TOOLS
+        NODE_HOME = tool name: "node-v6.11.4"
+        YARN_HOME = tool name: "yarn-v1.1.0"
+        SRC_URL = "https://gitlab.test.com/andrescidoncha/test"
+    }
+
+    stages {
+        stage('Download repo') {
+            steps {
+                git credentialsId: 'GitLabCredentials', url: "${SRC_URL}"
+            }
+        }
+
+        stage("Test") {
+            steps {
+                withNPM(npmrcConfig:  "npmrc") {
+                    sh 'yarn lint'
+                    sh 'yarn test'
+                }
+                junit 'build/test/*.xml'
+            }
+        }
+
+        stage("Launch API") {
+            when {
+                expression { params.BOOLEAN_PARAM }
+                expression { currentBuild.resultIsBetterOrEqualTo('SUCCESS') }
+            }
+            steps {
+                httpRequest (authentication: 'DevDeployCredentials',
+                             consoleLogResponseBody: true,
+                             customHeaders: [[maskValue: false, name: 'Content-Type', value: 'application/json']],
+                             httpMode: 'POST',
+                             requestBody: "{\"config\":\"${params.choice}\"}",
+                             responseHandle: 'NONE',
+                             url: "http://${params.STRING_PARAM}/test",
+                             validResponseCodes: '100:399')
+            }
+        }
+    }
+
+    post {
+        success {
+            script{
+                if (env.gitlabMergeRequestId){
+                    addGitLabMRComment comment: ":white_check_mark: Build [${BUILD_NUMBER}](${BUILD_URL}) passed"
+                }
+            }
+        }
+
+        unstable {
+            script{
+                if (env.gitlabMergeRequestId){
+                    addGitLabMRComment comment: ":warning: Build [${BUILD_NUMBER}](${BUILD_URL}) failed tests"
+                }
+            }
+        }
+
+        failure {
+            script {
+                if (env.gitlabMergeRequestId){
+                    addGitLabMRComment comment: ":x: Build [${BUILD_NUMBER}](${BUILD_URL}console) failed"
+                }
+            }
+        }
+
+        cleanup {
+            cleanWs()
+        }
+    }
+}
